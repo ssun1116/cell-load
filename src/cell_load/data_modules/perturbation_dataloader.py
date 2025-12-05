@@ -565,6 +565,110 @@ class PerturbationDataModule(LightningDataModule):
 
             logger.info("\n")
 
+    ## Added helper code to access metadata for biological batches
+
+    def _get_obs_column_values(
+        self,
+        ds: PerturbationDataset,
+        cache,                  # GlobalH5MetadataCache
+        col: str,
+        row_indices: np.ndarray # positions (row indices) to extract
+    ) -> np.ndarray:
+        """
+        Return per-cell values for `obs[col]` aligned with the given `row_indices`.
+        This function tries, in order:
+            (A) Reading from ds.metadata_cache (supports categorical code → category mapping)
+            (B) Reading directly from the HDF5 file (either obs/col or obs/col + categories)
+        Always returns a numpy array of strings: np.ndarray[str].
+        """
+        import numpy as np
+        import h5py
+
+        # (A) Try reading from metadata_cache first
+        mc = getattr(ds, "metadata_cache", None)
+        if mc is None:
+            mc = cache
+
+        # (A-1) Case: metadata_cache contains categorical codes and category labels
+        codes_attr = f"{col}_codes"
+        cats_attr  = f"{col}_categories"
+        if hasattr(mc, codes_attr) and hasattr(mc, cats_attr):
+            codes = getattr(mc, codes_attr)
+            cats  = getattr(mc, cats_attr)  # list-like of str
+            vals  = np.asarray(cats, dtype=object)[codes]  # map integer codes to string labels
+            return vals[row_indices].astype(str)
+
+        # (A-2) Case: metadata_cache holds direct arrays in a dict-like structure
+        for candidate in ("obs", "metadata", "obs_dict", "meta"):
+            if hasattr(mc, candidate):
+                obj = getattr(mc, candidate)
+                if isinstance(obj, dict) and col in obj:
+                    arr = np.asarray(obj[col])
+                    return arr[row_indices].astype(str)
+
+        # (B) Fall back to reading directly from the HDF5 file
+        h5_path = getattr(ds, "h5_path", None)
+        if h5_path is None:
+            raise RuntimeError(
+                f"Cannot find h5_path on dataset to read obs['{col}'], and no metadata_cache available."
+            )
+
+        with h5py.File(h5_path, "r") as f:
+            # Typical HDF5 structures to handle:
+            #   obs/<col>                → per-cell integer codes OR raw strings
+            #   obs/<col>/categories     → optional list of category names
+            base = f"obs/{col}"
+            if base in f:
+                node = f[base]
+                # Case 1: obs/<col> is a group (categorical structure)
+                if isinstance(node, h5py.Group):
+                    # e.g. obs/col/codes, obs/col/categories
+                    if "categories" in node and "codes" in node:
+                        cats = np.asarray(node["categories"][:]).astype(str)
+                        codes = np.asarray(node["codes"][:]).astype(int)
+                        vals = cats[codes]
+                        return vals[row_indices].astype(str)
+                    elif "categories" in node and "values" in node:
+                        # Alternative naming convention: obs/col/values
+                        cats  = np.asarray(node["categories"][:]).astype(str)
+                        codes = np.asarray(node["values"][:]).astype(int)
+                        vals  = cats[codes]
+                        return vals[row_indices].astype(str)
+                    else:
+                        # Group exists but has an unexpected structure
+                        raise KeyError(
+                            f"H5 obs/{col} group exists but contains no recognizable 'codes' or 'categories' datasets."
+                        )
+                else:
+                    # Case 2: obs/<col> is a dataset
+                    # Two possibilities:
+                    #   - already string-encoded
+                    #   - integer-coded with separate obs/<col>/categories
+                    data = np.asarray(node[:])
+                    if np.issubdtype(data.dtype, np.integer):
+                        cat_path = f"obs/{col}/categories"
+                        if cat_path in f:
+                            cats = np.asarray(f[cat_path][:]).astype(str)
+                            vals = cats[data]
+                            return vals[row_indices].astype(str)
+                        else:
+                            raise KeyError(f"Found integer-coded obs/{col} but no categories dataset at {cat_path}")
+                    else:
+                        # String or byte array — safely convert to string
+                        vals = data.astype(str)
+                        return vals[row_indices].astype(str)
+
+            # Legacy or malformed case: categories exist but no per-cell values
+            cat_only = f"obs/{col}/categories"
+            if cat_only in f and f[cat_only].shape[0] > 0:
+                raise KeyError(
+                    f"obs/{col}/categories exists, but per-cell values are missing. "
+                    "Dataset does not store per-cell codes under obs/{col}."
+                )
+
+        raise KeyError(f"Could not resolve obs['{col}'] from cache or HDF5.")
+
+
     def _split_fewshot_celltype(
         self,
         ds: PerturbationDataset,
@@ -572,27 +676,25 @@ class PerturbationDataModule(LightningDataModule):
         ctrl_indices: np.ndarray,
         cache,
         pert_config: dict[str, list[str]],
+        celltype: str | None = None,   # for logging purposes
     ) -> dict[str, int]:
-        """Split a fewshot cell type according to perturbation assignments."""
+        """
+        Split a few-shot cell type according to perturbation assignments,
+        and assign *disjoint control sets* based on metadata rules:
+            - train: batch1_samp1, batch1_samp2
+            - val:   batch2_mouse1, batch2_mouse2
+            - test:  batch2_mouse3
+        """
         counts = {"train": 0, "val": 0, "test": 0}
 
-        # Get perturbation codes for this cell type
+        # 1. Split perturbations according to provided config
         pert_codes = cache.pert_codes[pert_indices]
-
-        # Create sets of perturbation codes for each split
         val_pert_names = set(pert_config.get("val", []))
         test_pert_names = set(pert_config.get("test", []))
 
-        val_pert_codes = set()
-        test_pert_codes = set()
+        val_pert_codes = {i for i, n in enumerate(cache.pert_categories) if n in val_pert_names}
+        test_pert_codes = {i for i, n in enumerate(cache.pert_categories) if n in test_pert_names}
 
-        for i, pert_name in enumerate(cache.pert_categories):
-            if pert_name in val_pert_names:
-                val_pert_codes.add(i)
-            if pert_name in test_pert_names:
-                test_pert_codes.add(i)
-
-        # Split perturbation indices by their codes
         val_mask = np.isin(pert_codes, list(val_pert_codes))
         test_mask = np.isin(pert_codes, list(test_pert_codes))
         train_mask = ~(val_mask | test_mask)
@@ -601,91 +703,87 @@ class PerturbationDataModule(LightningDataModule):
         test_pert_indices = pert_indices[test_mask]
         train_pert_indices = pert_indices[train_mask]
 
-        # # Split controls proportionally
-        # rng = np.random.default_rng(self.random_seed)
-        # ctrl_indices_shuffled = rng.permutation(ctrl_indices)
+        print("[INFO] Control split by Biological Batch in progress...")
 
-        # n_val = len(val_pert_indices)
-        # n_test = len(test_pert_indices)
-        # n_train = len(train_pert_indices)
-        # total_pert = n_val + n_test + n_train
+        # 2. Split control cells based on metadata (BioSamp)
+        bio = self._get_obs_column_values(ds, cache, col="BioSamp", row_indices=ctrl_indices)
+        bio = np.char.strip(bio.astype(str))
 
-        # if total_pert > 0:
-        #     # Create subsets
-        #     if len(val_pert_indices) > 0:
-        #         subset = ds.to_subset_dataset(
-        #             "val", val_pert_indices, ctrl_indices_shuffled
-        #         )
-        #         self.val_datasets.append(subset)
-        #         counts["val"] = len(subset)
+        train_ctrl_mask = np.isin(bio, ["batch1_samp1", "batch1_samp2"])
+        val_ctrl_mask   = np.isin(bio, ["batch2_mouse1", "batch2_mouse2"])
+        test_ctrl_mask  = np.isin(bio, ["batch2_mouse3"])
 
-        #     if len(test_pert_indices) > 0:
-        #         subset = ds.to_subset_dataset(
-        #             "test", test_pert_indices, ctrl_indices_shuffled
-        #         )
-        #         self.test_datasets.append(subset)
-        #         counts["test"] = len(subset)
+        # Ensure disjoint splits (priority: train > val > test)
+        val_ctrl_mask  &= ~train_ctrl_mask
+        test_ctrl_mask &= ~(train_ctrl_mask | val_ctrl_mask)
 
-        #     subset = ds.to_subset_dataset(
-        #         "train", train_pert_indices, ctrl_indices_shuffled
-        #     )
-        #     self.train_datasets.append(subset)
-        #     counts["train"] = len(subset)
-
-        print("[INFO] Control split in progress...")
-
-        # Split controls disjointly (no reuse across splits)
         rng = np.random.default_rng(self.random_seed)
-        ctrl_indices_shuffled = rng.permutation(ctrl_indices)
+        train_ctrl_indices = rng.permutation(ctrl_indices[train_ctrl_mask])
+        val_ctrl_indices   = rng.permutation(ctrl_indices[val_ctrl_mask])
+        test_ctrl_indices  = rng.permutation(ctrl_indices[test_ctrl_mask])
 
-        n_val = len(val_pert_indices)
-        n_test = len(test_pert_indices)
-        n_train = len(train_pert_indices)
-        total_pert = n_val + n_test + n_train
+        # 3. Log split summary
+        n_train_ctrl = len(train_ctrl_indices)
+        n_val_ctrl   = len(val_ctrl_indices)
+        n_test_ctrl  = len(test_ctrl_indices)
+        prefix = f"[CTRL SPLIT]{f' ct='+celltype if celltype else ''}"
+        print(f"{prefix} counts  | train={n_train_ctrl}  val={n_val_ctrl}  test={n_test_ctrl}  (total_ctrl_in_ct={len(ctrl_indices)})")
 
-        assert total_pert > 0, "At least one perturbation must exist across splits."
+        # Check for overlap between control sets
+        train_set = set(train_ctrl_indices.tolist())
+        val_set   = set(val_ctrl_indices.tolist())
+        test_set  = set(test_ctrl_indices.tolist())
+        overlap_tv = train_set & val_set
+        overlap_tt = train_set & test_set
+        overlap_vt = val_set & test_set
+        if overlap_tv or overlap_tt or overlap_vt:
+            print(f"[WARN]{f' ct='+celltype if celltype else ''} control indices overlap detected! "
+                f"train∩val={len(overlap_tv)}, train∩test={len(overlap_tt)}, val∩test={len(overlap_vt)}")
 
-        ## Split controls proportionally
-        n_ctrl = len(ctrl_indices_shuffled)
-        p_train = n_train / total_pert
-        p_val = n_val / total_pert
-        p_test = n_test / total_pert
+        # Check for unassigned controls (not matched by any rule)
+        assigned = len(train_set | val_set | test_set)
+        unassigned = len(ctrl_indices) - assigned
+        if unassigned > 0:
+            print(f"[INFO]{f' ct='+celltype if celltype else ''} {unassigned} control cells did not match any rule (unused).")
 
-        ctrl_train_n = int(round(n_ctrl * p_train))
-        ctrl_val_n   = int(round(n_ctrl * p_val))
-        ctrl_test_n  = n_ctrl - ctrl_train_n - ctrl_val_n  
+        # Count BioSamp distribution in each split
+        def _counts_by_value(arr):
+            vals, counts = np.unique(arr, return_counts=True)
+            return dict(zip(vals.tolist(), counts.tolist()))
 
+        train_bio = bio[np.isin(ctrl_indices, train_ctrl_indices)]
+        val_bio   = bio[np.isin(ctrl_indices, val_ctrl_indices)]
+        test_bio  = bio[np.isin(ctrl_indices, test_ctrl_indices)]
 
-        train_ctrl_indices = ctrl_indices_shuffled[:ctrl_train_n]
-        val_ctrl_indices   = ctrl_indices_shuffled[ctrl_train_n:ctrl_train_n + ctrl_val_n]
-        test_ctrl_indices  = ctrl_indices_shuffled[ctrl_train_n + ctrl_val_n:]
+        print(f"{prefix} BioSamp | train={_counts_by_value(train_bio)}")
+        print(f"{prefix} BioSamp | val  ={_counts_by_value(val_bio)}")
+        print(f"{prefix} BioSamp | test ={_counts_by_value(test_bio)}")
 
-        ## Assign different control set to each split
+        # 4. Warn if there are perturbations but no matching controls
+        def _warn_if_empty(name, n_pert, n_ctrl):
+            if n_pert > 0 and n_ctrl == 0:
+                print(f"[WARN] No control matched for {name}: pert={n_pert}, ctrl={n_ctrl}. Check rules/metadata.")
+        _warn_if_empty("train", len(train_pert_indices), len(train_ctrl_indices))
+        _warn_if_empty("val",   len(val_pert_indices),   len(val_ctrl_indices))
+        _warn_if_empty("test",  len(test_pert_indices),  len(test_ctrl_indices))
 
-        if total_pert > 0:
-            # Create subsets
-            if len(val_pert_indices) > 0:
-                subset = ds.to_subset_dataset(
-                    "val", val_pert_indices, val_ctrl_indices
-                )
-                self.val_datasets.append(subset)
-                counts["val"] = len(subset)
+        # 5. Create subsets for each split
+        if len(val_pert_indices) > 0:
+            subset = ds.to_subset_dataset("val", val_pert_indices, val_ctrl_indices)
+            self.val_datasets.append(subset)
+            counts["val"] = len(subset)
 
-            if len(test_pert_indices) > 0:
-                subset = ds.to_subset_dataset(
-                    "test", test_pert_indices, test_ctrl_indices
-                )
-                self.test_datasets.append(subset)
-                counts["test"] = len(subset)
+        if len(test_pert_indices) > 0:
+            subset = ds.to_subset_dataset("test", test_pert_indices, test_ctrl_indices)
+            self.test_datasets.append(subset)
+            counts["test"] = len(subset)
 
-            subset = ds.to_subset_dataset(
-                "train", train_pert_indices, train_ctrl_indices
-            )
-            self.train_datasets.append(subset)
-            counts["train"] = len(subset)
-
+        subset = ds.to_subset_dataset("train", train_pert_indices, train_ctrl_indices)
+        self.train_datasets.append(subset)
+        counts["train"] = len(subset)
 
         return counts
+
 
     def _find_dataset_files(self, dataset_path: Path) -> dict[str, Path]:
         files: Dict[str, Path] = {}
